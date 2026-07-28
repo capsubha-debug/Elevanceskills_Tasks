@@ -1,0 +1,85 @@
+import os
+from textblob import TextBlob
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from langchain.chains import LLMChain
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class SentimentAwareChatbot:
+    def __init__(self, escalation_threshold=-0.6):
+        self.escalation_threshold = escalation_threshold
+        # Initialize the LLM (using OpenAI as an example)
+        self.llm = ChatOpenAI(temperature=0.3, model="gpt-3.5-turbo")
+        self._setup_prompts()
+
+    def _setup_prompts(self):
+        """Sets up the prompt templates for different emotional states."""
+        
+        # 1. Standard Response Template
+        self.standard_prompt = PromptTemplate(
+            input_variables=["user_message"],
+            template="You are a helpful customer support bot. Respond to this query clearly and concisely: {user_message}"
+        )
+        self.standard_chain = LLMChain(llm=self.llm, prompt=self.standard_prompt)
+
+        # 2. De-escalation Template (For slightly negative sentiment)
+        self.deescalation_prompt = PromptTemplate(
+            input_variables=["user_message"],
+            template="You are a customer support bot dealing with a frustrated customer. Acknowledge their frustration, apologize for the inconvenience, and try to solve the issue: {user_message}"
+        )
+        self.deescalation_chain = LLMChain(llm=self.llm, prompt=self.deescalation_prompt)
+
+        # 3. Celebratory Template (For highly positive sentiment)
+        self.positive_prompt = PromptTemplate(
+            input_variables=["user_message"],
+            template="You are a customer support bot. The user is very happy. Match their energy, express gratitude, and assist them if needed: {user_message}"
+        )
+        self.positive_chain = LLMChain(llm=self.llm, prompt=self.positive_prompt)
+
+    def analyze_sentiment(self, text: str) -> float:
+        """
+        Analyzes text and returns a sentiment score between -1.0 (negative) and 1.0 (positive).
+        """
+        analysis = TextBlob(text)
+        # Polarity score: [-1.0, 1.0]
+        return analysis.sentiment.polarity
+
+    def process_message(self, user_message: str) -> str:
+        """Processes the message and routes it based on sentiment."""
+        
+        sentiment_score = self.analyze_sentiment(user_message)
+        print(f"[Debug] Sentiment Score: {sentiment_score:.2f}")
+
+        # 1. Highly Negative: Trigger Escalation Protocol
+        if sentiment_score <= self.escalation_threshold:
+            return "I am so sorry you are experiencing this. I want to make sure this gets resolved immediately. I am transferring you to a human agent right now."
+
+        # 2. Moderately Negative: Attempt De-escalation
+        elif -0.6 < sentiment_score < -0.1:
+            return self.deescalation_chain.run(user_message=user_message)
+
+        # 3. Positive: Match Energy
+        elif sentiment_score > 0.4:
+            return self.positive_chain.run(user_message=user_message)
+
+        # 4. Neutral/Standard: Informational Response
+        else:
+             return self.standard_chain.run(user_message=user_message)
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    bot = SentimentAwareChatbot()
+
+    test_messages = [
+        "Where is my package? It was supposed to be here yesterday.", # Moderately Negative
+        "This is the worst service I have ever experienced. Cancel my account immediately!", # Highly Negative
+        "Thanks so much for your help! The new feature works perfectly.", # Positive
+        "What are your business hours?", # Neutral
+    ]
+
+    for msg in test_messages:
+        print(f"\nUser: {msg}")
+        response = bot.process_message(msg)
+        print(f"Bot: {response}")
