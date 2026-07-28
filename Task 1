@@ -1,0 +1,64 @@
+import time
+import schedule
+import hashlib
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+
+# Configuration
+SOURCES = ["https://example.com/latest-updates", "https://example.com/news"]
+VECTOR_DB_DIR = "./chroma_db"
+
+def generate_hash(text: str) -> str:
+    """Generate a unique MD5 hash for a text chunk to prevent duplication."""
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
+
+def update_knowledge_base():
+    print("Starting scheduled knowledge base update...")
+    
+    # 1. Extract Data
+    loader = WebBaseLoader(SOURCES)
+    documents = loader.load()
+    
+    if not documents:
+        print("No new documents found. Skipping update.")
+        return
+
+    # 2. Process and Chunk Data
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000, 
+        chunk_overlap=150
+    )
+    chunks = text_splitter.split_documents(documents)
+    
+    # 3. Deduplicate (Check if chunk already exists in DB)
+    # Note: In production, you'd check these IDs against your DB before embedding
+    ids = [generate_hash(chunk.page_content) for chunk in chunks]
+    
+    # 4. Embed and Upsert
+    embeddings = OpenAIEmbeddings()
+    vector_store = Chroma(
+        persist_directory=VECTOR_DB_DIR, 
+        embedding_function=embeddings
+    )
+    
+    try:
+        # Chroma's add_documents automatically handles upserts if IDs match
+        vector_store.add_documents(documents=chunks, ids=ids)
+        print(f"Successfully processed and upserted {len(chunks)} chunks.")
+    except Exception as e:
+        print(f"Failed to update vector database: {e}")
+
+# Schedule the job to run every day at 2:00 AM
+schedule.every().day.at("02:00").do(update_knowledge_base)
+
+if __name__ == "__main__":
+    print("Knowledge base updater service is running...")
+    # Run immediately on startup for testing
+    update_knowledge_base() 
+    
+    # Keep the script running to check the schedule
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
