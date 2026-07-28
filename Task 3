@@ -1,0 +1,155 @@
+#Data Processing & Vector DB Setup (Backend)
+
+# build_db.py
+import os
+import xml.etree.ElementTree as ET
+import chromadb
+from sentence_transformers import SentenceTransformer
+
+# 1. Initialize the embedding model. 
+# 'all-MiniLM-L6-v2' is fast, but for medical data, a domain-specific 
+# model like 'pritamdeka/S-PubMedBert-MS-MARCO' yields better accuracy.
+print("Loading Embedding Model...")
+model = SentenceTransformer('all-MiniLM-L6-v2') 
+
+# 2. Initialize ChromaDB
+chroma_client = chromadb.PersistentClient(path="./medquad_db")
+collection = chroma_client.get_or_create_collection(name="medical_qa")
+
+def parse_medquad_xml(folder_path):
+    """Parses MedQuAD XML files and yields Q&A pairs."""
+    qa_pairs = []
+    # MedQuAD has subfolders for different sources (e.g., '1_National_Institutes_of_Health')
+    for root, dirs, files in os.walk(folder_path):
+        for file in files:
+            if file.endswith(".xml"):
+                tree = ET.parse(os.path.join(root, file))
+                root_node = tree.getroot()
+                
+                # XML structure: <QAPairs> -> <QAPair> -> <Question> & <Answer>
+                for qa_pair in root_node.findall('.//QAPair'):
+                    question = qa_pair.find('Question').text
+                    answer = qa_pair.find('Answer').text
+                    
+                    if question and answer:
+                        qa_pairs.append({
+                            "question": question.strip(),
+                            "answer": answer.strip()
+                        })
+    return qa_pairs
+
+# 3. Process and Index
+print("Parsing XML files...")
+# Assuming you cloned the repo into a folder named 'MedQuAD'
+# We will use just one folder for this example to save time
+raw_data = parse_medquad_xml("./MedQuAD/1_National_Cancer_Institute") 
+
+print(f"Found {len(raw_data)} Q&A pairs. Indexing...")
+
+# Batch processing for efficiency
+batch_size = 100
+for i in range(0, len(raw_data), batch_size):
+    batch = raw_data[i:i+batch_size]
+    
+    questions = [item["question"] for item in batch]
+    answers = [item["answer"] for item in batch]
+    ids = [f"qa_{i+j}" for j in range(len(batch))]
+    
+    # Generate embeddings for the questions
+    embeddings = model.encode(questions).tolist()
+    
+    # Store in Chroma
+    # We store the question to match against, and the answer in metadata to retrieve
+    collection.add(
+        embeddings=embeddings,
+        documents=questions, 
+        metadatas=[{"answer": ans} for ans in answers],
+        ids=ids
+    )
+
+print("Database built successfully!")
+
+#The Streamlit Application (Frontend & Logic)
+
+# app.py
+import streamlit as st
+import chromadb
+from sentence_transformers import SentenceTransformer
+import spacy
+
+# --- Initialization ---
+# Use st.cache_resource so models aren't reloaded on every UI interaction
+@st.cache_resource
+def load_models():
+    # Load same embedding model used for indexing
+    embedder = SentenceTransformer('all-MiniLM-L6-v2')
+    
+    # Load SciSpacy for Medical NER
+    nlp = spacy.load("en_core_sci_sm")
+    
+    # Connect to ChromaDB
+    chroma_client = chromadb.PersistentClient(path="./medquad_db")
+    collection = chroma_client.get_collection(name="medical_qa")
+    
+    return embedder, nlp, collection
+
+embedder, nlp, collection = load_models()
+
+# --- UI Setup ---
+st.set_page_config(page_title="MedQuAD Assistant", page_icon="⚕️")
+
+st.title("⚕️ Medical Q&A Assistant")
+st.markdown("""
+*Disclaimer: This tool is for educational purposes only and relies on the MedQuAD dataset. 
+It is not a substitute for professional medical advice.*
+""")
+
+# --- Chat Interface ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User Input
+if user_query := st.chat_input("Ask a medical question (e.g., 'What are the symptoms of Glaucoma?'):"):
+    
+    # Display user query
+    with st.chat_message("user"):
+        st.markdown(user_query)
+    st.session_state.messages.append({"role": "user", "content": user_query})
+
+    # --- Processing ---
+    with st.chat_message("assistant"):
+        with st.spinner("Analyzing and searching databases..."):
+            
+            # 1. Entity Extraction
+            doc = nlp(user_query)
+            entities = [ent.text for ent in doc.ents]
+            
+            # 2. Vector Retrieval
+            query_embedding = embedder.encode(user_query).tolist()
+            results = collection.query(
+                query_embeddings=[query_embedding],
+                n_results=1 # Fetch top match
+            )
+            
+            # 3. Formatting the Output
+            if results['distances'][0][0] < 1.5: # Threshold for relevance (varies by model)
+                matched_question = results['documents'][0][0]
+                retrieved_answer = results['metadatas'][0][0]['answer']
+                
+                response = f"**I found a similar question in my database:**\n_{matched_question}_\n\n"
+                response += f"**Answer:**\n{retrieved_answer}\n\n"
+                
+                if entities:
+                     response += f"---\n*Medical Entities detected in your query:* {', '.join(entities)}"
+            else:
+                response = "I couldn't find a highly relevant answer to that specific question in the MedQuAD dataset. Please try rephrasing or asking about a different topic."
+
+            st.markdown(response)
+    
+    # Save to history
+    st.session_state.messages.append({"role": "assistant", "content": response})
