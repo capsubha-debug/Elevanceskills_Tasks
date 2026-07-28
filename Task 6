@@ -1,0 +1,111 @@
+from typing import TypedDict, List
+from langgraph.graph import StateGraph, END
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.chat_models import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.vectorstores import Chroma
+from lingua import Language, LanguageDetectorBuilder
+
+# 1. Initialize Open Source Models
+# BAAI/bge-m3 is the SOTA for cross-lingual zero-shot retrieval
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3") 
+vectorstore = Chroma(persist_directory="./arxiv_chroma_db", embedding_function=embeddings)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+# Use Qwen-2.5 (highly optimized for multilingual reasoning) or Llama-3.1 via Ollama
+llm = ChatOllama(model="qwen2.5", temperature=0.2)
+
+# Fast offline language detector (Supports English, French, Spanish, Mandarin, etc.)
+languages = [Language.ENGLISH, Language.FRENCH, Language.SPANISH, Language.CHINESE]
+detector = LanguageDetectorBuilder.from_languages(*languages).build()
+
+# 2. Define the Agent State
+class AgentState(TypedDict):
+    user_query: str
+    chat_history: List[HumanMessage | AIMessage]
+    detected_language: str
+    retrieved_context: str
+    final_response: str
+
+# 3. Node: Language Detection & Context Parsing
+def analyze_input(state: AgentState) -> AgentState:
+    query = state["user_query"]
+    
+    # Automatically detect the language of the latest query
+    detected = detector.detect_language_of(query)
+    lang_name = detected.name if detected else "ENGLISH"
+    
+    # Note: Because we use cross-lingual embeddings (bge-m3), 
+    # we embed the raw query (e.g., in French) directly. No translation needed.
+    docs = retriever.invoke(query)
+    context = "\n\n".join([d.page_content for d in docs])
+    
+    return {"detected_language": lang_name, "retrieved_context": context}
+
+# 4. Node: Cross-Lingual Reasoning & Generation
+def generate_response(state: AgentState) -> AgentState:
+    
+    # This prompt forces the LLM to act as a cross-lingual synthesizer.
+    # It takes English context, mixed-language history, and replies in the target language.
+    multilingual_prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert multilingual AI assistant.
+        
+        INSTRUCTIONS:
+        1. You must respond in the EXACT language specified here: [TARGET LANGUAGE: {language}].
+        2. If the user's prompt mixes languages (code-switching), reply in the target language.
+        3. Use the provided context to answer the query. The context may be in a different language than the target language. Translate the concepts seamlessly in your head.
+        4. Maintain conversational continuity with the chat history.
+        
+        CONTEXT:
+        {context}
+        """),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{query}")
+    ])
+    
+    chain = multilingual_prompt | llm
+    
+    response = chain.invoke({
+        "language": state["detected_language"],
+        "context": state["retrieved_context"],
+        "chat_history": state["chat_history"],
+        "query": state["user_query"]
+    })
+    
+    return {"final_response": response.content}
+
+# 5. Build the LangGraph State Machine
+workflow = StateGraph(AgentState)
+
+workflow.add_node("analyze", analyze_input)
+workflow.add_node("generate", generate_response)
+
+workflow.set_entry_point("analyze")
+workflow.add_edge("analyze", "generate")
+workflow.add_edge("generate", END)
+
+# Compile the multi-lingual app
+multilingual_app = workflow.compile()
+
+# --- Example Multilingual Execution ---
+if __name__ == "__main__":
+    # Simulate a user switching from English to French to Spanish
+    history = []
+    
+    turn_1 = "What is the Transformer architecture?" # English
+    res_1 = multilingual_app.invoke({"user_query": turn_1, "chat_history": history})
+    history.extend([HumanMessage(content=turn_1), AIMessage(content=res_1["final_response"])])
+    
+    # The user follows up in French. The bot understands "il" refers to the Transformer.
+    turn_2 = "Comment il gère le contexte à long terme ?" # French
+    res_2 = multilingual_app.invoke({"user_query": turn_2, "chat_history": history})
+    history.extend([HumanMessage(content=turn_2), AIMessage(content=res_2["final_response"])])
+    
+    # The user asks a final question in Spanish with some English code-switching
+    turn_3 = "Puedes resumir eso en tres bullet points? No use complex jargon." # Spanish/English mixed
+    res_3 = multilingual_app.invoke({"user_query": turn_3, "chat_history": history})
+    
+    print(res_3["final_response"]) 
+    # Output will be in Spanish (the primary language of the final query), 
+    # drawing on the English documentation and the French/English chat history.
