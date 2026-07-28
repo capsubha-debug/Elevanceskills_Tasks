@@ -1,0 +1,89 @@
+import base64
+from typing import List, Dict, Optional
+from pydantic import BaseModel
+
+# 1. State Management
+class AgentState(BaseModel):
+    user_prompt: str
+    image_data: Optional[bytes] = None
+    chat_history: List[Dict[str, str]] = []
+    extracted_image_context: str = ""
+    draft_response: str = ""
+    final_response: str = ""
+    needs_clarification: bool = False
+
+# 2. Vision Processing Node
+def process_image(state: AgentState) -> AgentState:
+    """Extracts facts, OCR, and structural data from the image."""
+    if not state.image_data:
+        return state
+        
+    # In practice: Call your Vision API (Gemini/GPT-4V) here
+    # Prompt: "Describe this image in detail. Read all text. Identify key entities."
+    encoded_image = base64.b64encode(state.image_data).decode("utf-8")
+    
+    # Mock API call
+    vision_analysis = call_vision_model(
+        prompt="Extract all factual information from this image.", 
+        image=encoded_image
+    )
+    
+    state.extracted_image_context = vision_analysis
+    return state
+
+# 3. Reasoning & Generation Node
+def synthesize_response(state: AgentState) -> AgentState:
+    """Combines text history, user prompt, and image data to reason."""
+    
+    system_prompt = f"""
+    You are a precise, evidence-based assistant. 
+    Context from the user's image: {state.extracted_image_context}
+    Previous Conversation: {state.chat_history}
+    
+    User Query: {state.user_prompt}
+    
+    Instructions:
+    1. Base your answer ONLY on the provided context and history.
+    2. If the image is blurry or the query asks for something not visible, state that explicitly.
+    3. Reason step-by-step before answering.
+    """
+    
+    # Mock API call
+    draft = call_llm(prompt=system_prompt)
+    state.draft_response = draft
+    return state
+
+# 4. Validation & Ambiguity Node
+def validate_output(state: AgentState) -> AgentState:
+    """Checks the draft against the inputs to ensure no hallucinations."""
+    
+    validation_prompt = f"""
+    Review this draft response: '{state.draft_response}'
+    Against this image data: '{state.extracted_image_context}'
+    And this user query: '{state.user_prompt}'
+    
+    Did the draft invent any facts not present in the image data? 
+    Is it answering the user's question directly?
+    If it fails, rewrite it to be safe and accurate.
+    """
+    
+    # Mock API call
+    final = call_llm(prompt=validation_prompt)
+    state.final_response = final
+    return state
+
+# 5. The Orchestrator
+def run_assistant(user_prompt: str, image_bytes: bytes, history: list) -> str:
+    # Initialize State
+    state = AgentState(
+        user_prompt=user_prompt, 
+        image_data=image_bytes,
+        chat_history=history
+    )
+    
+    # Execute Graph
+    state = process_image(state)
+    state = synthesize_response(state)
+    state = validate_output(state)
+    
+    return state.final_response
